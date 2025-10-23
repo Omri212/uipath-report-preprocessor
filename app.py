@@ -7,8 +7,22 @@ import streamlit as st
 
 
 st.set_page_config(page_title="Excel Column Planner", page_icon="🧭", layout="wide")
-st.title("🧭 Excel Column Planner")
+st.title("🧭🧭 Excel Column Planner")
 st.caption("Upload an Excel/CSV, choose per-column actions (remove / rename / reorder), and export the plan and transformed file.")
+
+# --- Session State Initialization ---
+# plan_data_df will now be indexed by 'original' column name for stable tracking
+if 'plan_data_df' not in st.session_state:
+    st.session_state.plan_data_df = pd.DataFrame()
+if 'file_kind' not in st.session_state:
+    st.session_state.file_kind = None
+if 'sheet_name' not in st.session_state:
+    st.session_state.sheet_name = None
+if 'last_file_name' not in st.session_state:
+    st.session_state.last_file_name = None
+if 'editor_key_version' not in st.session_state:
+    st.session_state.editor_key_version = 0
+# ------------------------------------
 
 # -----------------------------------------------------------------------------
 # Helpers
@@ -60,12 +74,17 @@ def validate_and_build(headers: List[str], rows_df: pd.DataFrame) -> Dict[str, o
     """
     rows_df columns: ['original', 'remove', 'new_name', 'order']
     Build: remove[], rename{old:new}, order[new/kept...]
+
+    IMPORTANT: rows_df here is the CANONICAL, index-reset DF.
     """
     if rows_df.empty:
         raise ValueError("No rows provided for plan.")
 
+    # Ensure 'remove' is boolean and handle missing 'order' values
     rows_df["remove"] = rows_df["remove"].fillna(False).astype(bool)
     rows_df["new_name"] = rows_df["new_name"].fillna("").astype(str).str.strip()
+
+    # No need to reset_index(drop=True) here if rows_df is already the canonical one
 
     kept_df = rows_df.loc[~rows_df["remove"].astype(bool)].copy()
 
@@ -82,19 +101,26 @@ def validate_and_build(headers: List[str], rows_df: pd.DataFrame) -> Dict[str, o
     positions: List[Optional[int]] = []
     used = set()
     for pos in pos_raw:
-        if pos in (None, "", " ", 0, "0"):
+        # Normalize: Treat None, empty string, or 0 as "no explicit order"
+        if pd.isna(pos) or pos in ("", " ", 0, "0"):
             positions.append(None)
             continue
+
         if isinstance(pos, str):
             if not pos.isdigit():
                 raise ValueError("Order must be a number in the range 1..N or left blank.")
             pos = int(pos)
-        if not (1 <= int(pos) <= max(1, n) if n > 0 else 1):
+
+        # Ensure it's treated as an integer
+        pos = int(pos)
+
+        if not (1 <= pos <= max(1, n) if n > 0 else 1):
             raise ValueError(f"Order '{pos}' out of range. Must be between 1 and {max(1, n)}.")
-        if int(pos) in used:
+        if pos in used:
             raise ValueError(f"Duplicate order slot '{pos}'. Each position may be used once.")
-        used.add(int(pos))
-        positions.append(int(pos))
+
+        used.add(pos)
+        positions.append(pos)
 
     # Validate visible names uniqueness
     if len(set(final_names)) != len(final_names):
@@ -107,9 +133,11 @@ def validate_and_build(headers: List[str], rows_df: pd.DataFrame) -> Dict[str, o
     for _, r in rows_df.iterrows():
         old = r["original"]
         new = (r["new_name"] or "").strip()
+        # Only include non-removed columns where a change happened
         if (not r["remove"]) and new and new != old:
             rename_map[old] = new
 
+    # Calculate final order based on explicit positions and relative fill-in
     order_list = compute_order(final_names, positions)
 
     return {
@@ -180,7 +208,8 @@ def make_prefilled_table(headers: List[str], plan: Dict[str, object]) -> pd.Data
         else:
             rows[k_idx]["order"] = None
 
-    return pd.DataFrame(rows, columns=["original", "remove", "new_name", "order"])
+    # Return DF with 'original' set as index for stable storage
+    return pd.DataFrame(rows, columns=["original", "remove", "new_name", "order"]).set_index("original")
 
 
 # -----------------------------------------------------------------------------
@@ -188,29 +217,47 @@ def make_prefilled_table(headers: List[str], plan: Dict[str, object]) -> pd.Data
 # -----------------------------------------------------------------------------
 with st.sidebar:
     st.header("1) Upload File")
+    # File is read outside of session state to ensure fresh upload is captured
     file = st.file_uploader("Choose .xlsx or .csv", type=["xlsx", "csv"], accept_multiple_files=False)
 
-    file_kind: Optional[str] = None
-    sheet_name: Optional[str] = None
+    # Use session state to store derived file info
+    st.session_state.file_kind = None
+    st.session_state.sheet_name = None
     headers: List[str] = []
 
+    # Store the uploaded file bytes persistently for later use in export_data
+    file_bytes = None
     if file is not None:
+        file_bytes = file.getvalue()
+
+        # Check if a new file was uploaded or sheet selection changed (simple check)
+        if st.session_state.last_file_name != file.name:
+            st.session_state.plan_data_df = pd.DataFrame() # Clear plan on new file
+            st.session_state.last_file_name = file.name
+
         try:
             if file.type in ("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",) or file.name.lower().endswith(".xlsx"):
-                file_kind = "xlsx"
-                xls = pd.ExcelFile(file)
-                if len(xls.sheet_names) > 1:
-                    sheet_name = st.selectbox("Sheet", xls.sheet_names, index=0)
-                else:
-                    sheet_name = xls.sheet_names[0]
-                headers = read_excel_headers(file.getvalue(), sheet_name)
-            else:
-                file_kind = "csv"
-                headers = read_csv_headers(file.getvalue())
+                st.session_state.file_kind = "xlsx"
+                xls = pd.ExcelFile(io.BytesIO(file_bytes))
 
-            st.success(f"Found {len(headers)} column(s)." + (f" Sheet: '{sheet_name}'" if sheet_name else ""))
+                selected_sheet = None
+                if len(xls.sheet_names) > 1:
+                    # Reset index=0 only if the selector is being displayed for the first time or sheet names changed
+                    # Use a unique key for the sheet selector to force re-render
+                    selected_sheet = st.selectbox("Sheet", xls.sheet_names, index=0, key="sheet_selector")
+                else:
+                    selected_sheet = xls.sheet_names[0]
+
+                st.session_state.sheet_name = selected_sheet
+                headers = read_excel_headers(file_bytes, st.session_state.sheet_name)
+            else:
+                st.session_state.file_kind = "csv"
+                headers = read_csv_headers(file_bytes)
+
+            st.success(f"Found {len(headers)} column(s)." + (f" Sheet: '{st.session_state.sheet_name}'" if st.session_state.sheet_name else ""))
         except Exception as e:
             st.error(f"Failed to read file: {e}")
+            file = None # Invalidate file if read failed
 
 if file is None or not headers:
     st.info("⬅️ Upload a file to begin.")
@@ -222,10 +269,11 @@ if file is None or not headers:
 st.header("2) Configure columns")
 st.write(
     "For each column: **Remove** (checkbox), optional **New name**, and optional **Order** (1..N). "
-    "Leave **Order** blank to keep current relative order."
+    "Check **'Remove'** to move a column to the bottom. Use **'Order'** to move a row to the top."
 )
 
 # Optional: load plan JSON to prefill
+prefilled = None
 with st.expander("Load an existing plan (JSON)"):
     plan_file = st.file_uploader("Upload plan JSON", type=["json"], key="plan_json")
     if plan_file is not None:
@@ -235,22 +283,45 @@ with st.expander("Load an existing plan (JSON)"):
             st.success("Plan loaded. Table prefilled.")
         except Exception as e:
             st.error(f"Failed to load plan JSON: {e}")
-            prefilled = None
-    else:
-        prefilled = None
 
-# Default table
-default_df = pd.DataFrame({
-    "original": headers,
-    "remove": [False] * len(headers),
-    "new_name": [""] * len(headers),
-    "order": [None] * len(headers),
-})
+# --- Data Initialization/Sorting Logic ---
 
-start_df = prefilled if prefilled is not None else default_df
+# 1. Initialize data into session state if first run or new file
+if st.session_state.plan_data_df.empty or st.session_state.plan_data_df.index.tolist() != headers:
+    default_df = pd.DataFrame({
+        "original": headers,
+        "remove": [False] * len(headers),
+        "new_name": [""] * len(headers),
+        "order": [None] * len(headers),
+    }).set_index('original') # Set the stable index
 
+    start_df = prefilled if prefilled is not None else default_df
+    st.session_state.plan_data_df = start_df.copy() # Store the canonical (unsorted) base data
+
+# 2. Prepare the DataFrame for display/editing by applying the desired visual sort
+# We must reset the index before sorting so 'original' becomes a column again for sorting/display
+current_df_for_sort = st.session_state.plan_data_df.reset_index().copy()
+
+# Ensure 'remove' is boolean for proper sorting
+current_df_for_sort['remove'] = current_df_for_sort['remove'].astype(bool)
+
+# Convert 'order' to numeric, coercing NaNs for sorting purposes (NaNs go last)
+current_df_for_sort['sort_order_col'] = pd.to_numeric(current_df_for_sort['order'], errors='coerce')
+# Fill explicit NaNs (blanks/None) with a large number
+max_order = current_df_for_sort['sort_order_col'].max()
+fill_value = (max_order + 1) if pd.notna(max_order) else 999999
+current_df_for_sort['sort_order_col'] = current_df_for_sort['sort_order_col'].fillna(fill_value)
+
+# Perform the dynamic sort:
+sorted_df = current_df_for_sort.sort_values(
+    by=['remove', 'sort_order_col', 'original'],
+    ascending=[True, True, True],
+    ignore_index=True
+).drop(columns=['sort_order_col'])
+
+# 3. Render the data editor with the sorted DataFrame
 edited = st.data_editor(
-    start_df,
+    sorted_df, # Pass the sorted dataframe to the editor
     num_rows="fixed",
     use_container_width=True,
     column_config={
@@ -265,8 +336,28 @@ edited = st.data_editor(
         ),
     },
     hide_index=True,
-    key="plan_table",
+    key=f"plan_table_{st.session_state.editor_key_version}", # Dynamic key to force re-render
 )
+
+# 4. Update session state with the edited data for the next run/plan generation
+# CRITICAL FIX: We must compare the returned 'edited' DF (sorted) against the 'sorted_df'
+# that was displayed, and then merge the changes back into the *canonical* (unsorted, indexed) state.
+if not edited.equals(sorted_df):
+
+    # Identify which rows changed in the editor
+    # Since 'edited' is the sorted output, we merge it back to the canonical DF using 'original'
+    edited_with_index = edited.set_index('original')
+
+    # Update the canonical state with the user's latest edits. This ensures persistence (Fix 2).
+    # .update() performs a stable, index-based update of shared columns.
+    st.session_state.plan_data_df.update(edited_with_index)
+
+    # Increment key version to force the editor to re-render the rows in the new sorted order (Fix 1).
+    st.session_state.editor_key_version += 1
+
+    # --- FIX FOR INSTANT JUMP ---
+    # Force an immediate rerun to apply the new key and display the newly sorted data frame instantly.
+    st.rerun()
 
 # -----------------------------------------------------------------------------
 # Build & show outputs
@@ -287,7 +378,9 @@ download_file_container = st.empty()
 
 if run:
     try:
-        plan = validate_and_build(headers, edited)
+        # Use the latest CANONICAL data for plan generation
+        # Reset index to make 'original' a column again, matching the expected input of validate_and_build
+        plan = validate_and_build(headers, st.session_state.plan_data_df.reset_index())
 
         with output_container.container():
             st.subheader("remove:")
@@ -310,10 +403,11 @@ if run:
 
         if export_data:
             # Read full DF and apply plan
-            if file_kind == "xlsx":
-                df = read_excel_df(file.getvalue(), sheet_name)
+            if st.session_state.file_kind == "xlsx":
+                # Ensure we read the bytes from the persistent file object if available
+                df = read_excel_df(file_bytes, st.session_state.sheet_name)
             else:
-                df = read_csv_df(file.getvalue())
+                df = read_csv_df(file_bytes)
 
             transformed = apply_plan_to_df(df, plan)
 
